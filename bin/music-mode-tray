@@ -117,7 +117,7 @@ class StatusNotifierItem(dbus.service.Object):
         if prop == "IconName":
             return ICON_ON if self._on else ICON_OFF
         if prop == "Title":
-            return "Art Mode"
+            return "Music Mode"
         if prop == "ToolTip":
             tip = TOOLTIP_ON if self._on else TOOLTIP_OFF
             icon = ICON_ON if self._on else ICON_OFF

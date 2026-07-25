@@ -106,7 +106,9 @@ nft_block() {
             err "  cause: running kernel's modules are missing (kernel upgraded since boot?)"
             err "  fix: reboot"
         else
-            err "  fix: ./install.sh"
+            err "  cause: sudoers drop-in missing/invalid, or no active Bitwig scope"
+            err "  fix: re-run ./install.sh from your music-mode checkout"
+            err "  check: sudo -l | grep music-mode-nft"
         fi
         return 1
     fi

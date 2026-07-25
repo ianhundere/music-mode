@@ -185,9 +185,10 @@ sudo ./bin/bitwig-hosts off
 - [`systemd/user/music-mode-tray.service`](systemd/user/music-mode-tray.service) — user unit for the tray daemon
 - [`install.sh`](install.sh), [`uninstall.sh`](uninstall.sh) — installer and its reverse
 
-Files ending in `.in` are templates; `install.sh` renders them. The rendered
-copies are gitignored so a real username or `$HOME` can never be committed over
-the top of a template.
+Files ending in `.in` are templates; `install.sh` renders them. Rendering never
+happens inside the repo — the sudoers grant is rendered to a `mktemp` file and
+the desktop entry straight into `~/.local/share/applications` — so a real
+username or `$HOME` never appears in the working tree to begin with.
 
 ## Removal
 

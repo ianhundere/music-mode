@@ -50,6 +50,32 @@ DND_UNIT="music-mode-dnd.service"
 WAS_ON="false"
 OFF_FAILED="false"
 
+# recovery_notice() has to survive an abort, not just a clean finish. Under
+# `set -e` an unguarded `sudo rm -f` (a cancelled password prompt is enough)
+# would kill the script after remove_user_bins has already deleted the CLI —
+# precisely the state where the user needs the manual recovery commands and
+# no longer has the tool that would have printed them.
+on_exit() {
+    local rc=$?
+    recovery_notice
+    if [[ $rc -ne 0 ]]; then
+        print_msg "$RED" ""
+        print_msg "$RED" "✗ uninstall FAILED (exit $rc) — removal is INCOMPLETE"
+        print_msg "$RED" "  Re-run ./uninstall.sh, or finish by hand:"
+        print_msg "$RED" "    sudo rm -f $SUDOERS_DEST $NFT_WRAPPER_DEST"
+    fi
+}
+trap on_exit EXIT
+
+on_signal() {
+    trap - INT TERM
+    print_msg "$YELLOW" ""
+    log_warning "interrupted — uninstall is incomplete"
+    kill -"$1" $$
+}
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+
 require_unprivileged() {
     if [[ "$EUID" -eq 0 ]]; then
         log_error "do not run this uninstaller as root / under sudo."
@@ -62,6 +88,17 @@ require_unprivileged() {
         log_error "\$HOME is unset or not a directory — cannot resolve install paths"
         exit 1
     fi
+    if ! command -v sudo >/dev/null 2>&1; then
+        log_error "sudo not found — required to remove $SUDOERS_DEST and $NFT_WRAPPER_DEST"
+        exit 1
+    fi
+}
+
+# Ground truth for "is the firewall still engaged", independent of the
+# session file. `nft list table` needs root, so an unreadable result is
+# reported as unknown rather than guessed at.
+nft_table_loaded() {
+    sudo -n nft list table inet music_mode >/dev/null 2>&1
 }
 
 # Disengage while the sudoers grant is still in place. Prefers the
@@ -71,14 +108,27 @@ disengage() {
     [[ -x "$CLI_DEST" ]] && cli="$CLI_DEST"
     [[ -z "$cli" && -x "$SCRIPT_DIR/bin/music-mode" ]] && cli="$SCRIPT_DIR/bin/music-mode"
 
+    # The session file is the CLI's own notion of "on", but it can be absent
+    # while the ruleset is still loaded (session file deleted by hand, or a
+    # previous uninstall that got this far). Treat a live table as "on" too,
+    # otherwise the one state that most needs the recovery notice is the one
+    # state that never prints it.
     if [[ -f "$SESSION_FILE" ]]; then
         WAS_ON="true"
         log_warning "music-mode is currently ON — disengaging before uninstall"
+    elif nft_table_loaded; then
+        WAS_ON="true"
+        log_warning "the 'inet music_mode' table is loaded with no session file — disengaging anyway"
     fi
 
     if [[ -z "$cli" ]]; then
         log_warning "no music-mode CLI found — skipping 'music-mode off'"
         [[ "$WAS_ON" == "true" ]] && OFF_FAILED="true"
+        # kde_dnd_off lives in the CLI, so with no CLI the notification
+        # inhibit would survive the uninstall with nothing left to stop it.
+        if [[ "$DRY_RUN" != "true" ]]; then
+            systemctl --user stop "$DND_UNIT" >/dev/null 2>&1 || true
+        fi
         return 0
     fi
 
@@ -87,12 +137,21 @@ disengage() {
         return 0
     fi
 
-    if "$cli" off; then
-        log_ok "music-mode off"
-    else
+    # `music-mode off` exits 0 unconditionally — nft_unblock warns on failure
+    # rather than returning non-zero, and kde_dnd_off ends in `|| true`. Its
+    # exit status therefore proves nothing, so verify the actual table state
+    # instead of trusting it.
+    "$cli" off || true
+    if nft_table_loaded; then
         OFF_FAILED="true"
-        log_warning "'music-mode off' returned non-zero — the nftables table may still be loaded"
+        log_warning "'inet music_mode' is STILL loaded after 'music-mode off'"
+    else
+        log_ok "music-mode off"
     fi
+
+    # Belt and braces: the CLI stops this too, but it is the difference
+    # between a silenced desktop and a working one if that call failed.
+    systemctl --user stop "$DND_UNIT" >/dev/null 2>&1 || true
 }
 
 stop_tray() {
@@ -103,11 +162,18 @@ stop_tray() {
         return 0
     fi
 
-    systemctl --user disable --now "$TRAY_UNIT" >/dev/null 2>&1 || true
-    log_ok "$TRAY_UNIT stopped and disabled"
+    # Don't claim success for an operation whose failure was just swallowed,
+    # or for a unit that was never installed.
+    if systemctl --user disable --now "$TRAY_UNIT" >/dev/null 2>&1; then
+        log_ok "$TRAY_UNIT stopped and disabled"
+    else
+        log_info "  $TRAY_UNIT was not enabled (nothing to stop)"
+    fi
 
-    rm -f "$UNIT_DEST"
-    log_ok "removed $UNIT_DEST"
+    if [[ -e "$UNIT_DEST" ]]; then
+        rm -f "$UNIT_DEST"
+        log_ok "removed $UNIT_DEST"
+    fi
 
     systemctl --user daemon-reload >/dev/null 2>&1 || \
         log_warning "'systemctl --user daemon-reload' failed (no user session bus?)"
@@ -117,7 +183,7 @@ remove_user_bins() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_dry "remove $CLI_DEST"
         log_dry "remove $TRAY_DEST"
-        log_dry "remove $LEGACY_NFT_WRAPPER (legacy pre-173cb66 location, if present)"
+        log_dry "remove $LEGACY_NFT_WRAPPER (legacy user-writable location, if present)"
         return 0
     fi
     rm -f "$CLI_DEST" "$TRAY_DEST" "$LEGACY_NFT_WRAPPER"
@@ -166,8 +232,15 @@ remove_cache() {
     log_ok "removed $SESSION_DIR"
 }
 
+RECOVERY_NOTICE_SHOWN="false"
+
+# Called from the EXIT trap, so it must be safe to reach more than once and
+# must not itself fail under `set -e`.
 recovery_notice() {
+    [[ "$RECOVERY_NOTICE_SHOWN" == "true" ]] && return 0
+    [[ "$DRY_RUN" == "true" ]] && return 0
     [[ "$WAS_ON" != "true" && "$OFF_FAILED" != "true" ]] && return 0
+    RECOVERY_NOTICE_SHOWN="true"
 
     log_warning "music-mode was uninstalled mid-session."
     log_warning "If the network is still restricted or notifications are still muted,"
@@ -178,6 +251,21 @@ recovery_notice() {
 }
 
 main() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run) DRY_RUN=true ;;
+            -h|--help)
+                sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+                return 0
+                ;;
+            *)
+                log_error "unknown argument: $arg (accepts --dry-run, --help)"
+                return 1
+                ;;
+        esac
+    done
+
     log_info "==> Uninstalling music-mode"
     require_unprivileged
 
@@ -195,7 +283,8 @@ main() {
         return 0
     fi
 
-    recovery_notice
+    # recovery_notice is not called here — the EXIT trap owns it, so it
+    # prints on the abort paths too, which is where it actually matters.
     log_ok "music-mode uninstalled"
     log_info "Bitwig itself and its scope (music-mode-bitwig.scope) were left alone."
 }

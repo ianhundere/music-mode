@@ -14,7 +14,9 @@
 #
 # Usage:
 #   ./install.sh                 install
+#   ./install.sh --dry-run       preview: run every check that needs no root,
 #   DRY_RUN=true ./install.sh    print every destination + mode, write nothing
+#   ./install.sh --help          print this header
 #
 # Security invariants (do not "simplify" these away):
 #   * The nft wrapper is installed root-owned into /usr/local/bin. A
@@ -73,7 +75,8 @@ DESKTOP_DIR="$HOME/.local/share/applications"
 UNIT_DIR="$HOME/.config/systemd/user"
 DESKTOP_DEST="$DESKTOP_DIR/music-mode-toggle.desktop"
 UNIT_DEST="$UNIT_DIR/music-mode-tray.service"
-# Pre-173cb66 machines installed the wrapper here, where the user can
+# Older installs (before the wrapper was moved to a root-owned path in the
+# upstream sys-restore-t14s-arch repo) put it here, where the user can
 # rewrite it. Removed on every install.
 LEGACY_NFT_WRAPPER="$HOME/.local/bin/music-mode-nft"
 
@@ -82,14 +85,44 @@ SUDOERS_RULE=""
 TRAY_DEPS_OK="false"
 TMP_SUDOERS=""
 
-# Removes the rendered sudoers temp file on every exit path: success,
-# assertion failure, visudo rejection, or Ctrl-C.
+INSTALL_COMPLETE="false"
+
+# Removes the rendered sudoers temp file on every exit path, and — because
+# a partial install is worse than no install here — names the failure.
+# Without the banner the last line on screen is a green ✓ from the step
+# before the one that died, which reads as success.
+#
+# A half-install is specifically dangerous: install_local_bins() runs before
+# the wrapper and the grant, so an abort in between leaves a working CLI with
+# no nft wrapper behind it. `music-mode on` kills the browser, chat and editor
+# apps and launches Bitwig BEFORE it ever calls nft_block, so the next run
+# would tear down the session and then fail.
 cleanup() {
+    local rc=$?
     if [[ -n "$TMP_SUDOERS" && -f "$TMP_SUDOERS" ]]; then
         rm -f "$TMP_SUDOERS"
     fi
+    if [[ $rc -ne 0 && "$INSTALL_COMPLETE" != "true" ]]; then
+        print_msg "$RED" ""
+        print_msg "$RED" "✗ install FAILED (exit $rc) — see the last error above"
+        print_msg "$RED" "  The system may be PARTIALLY installed. Do not run 'music-mode on'"
+        print_msg "$RED" "  until this succeeds: it kills your apps before it checks the firewall."
+        print_msg "$RED" "  Fix the cause and re-run ./install.sh (it is an idempotent overwrite)."
+    fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+
+# Bare `trap cleanup INT TERM` would run the handler and then CARRY ON into
+# the privileged steps. Re-raise so the shell actually dies with the right
+# status and the EXIT trap still fires.
+on_signal() {
+    trap - INT TERM
+    print_msg "$YELLOW" ""
+    log_warning "interrupted — aborting install"
+    kill -"$1" $$
+}
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 
 # --- preconditions -----------------------------------------------------
 
@@ -235,8 +268,12 @@ install_local_bins() {
 }
 
 install_nft_wrapper() {
+    # /usr/local/bin exists on any normal system, but a minimal container or
+    # a hand-built root may not have it; create it root-owned rather than
+    # letting `install` fail with a bare "No such file or directory".
+    sudo mkdir -p "$(dirname "$NFT_WRAPPER_DEST")"
     sudo install -m 0755 -o root -g root "$SRC_NFT" "$NFT_WRAPPER_DEST"
-    # Pre-173cb66 machines kept the wrapper in a user-writable directory
+    # Older installs kept the wrapper in a user-writable directory
     # that also shadows the root-owned copy on $PATH.
     rm -f "$LEGACY_NFT_WRAPPER"
     log_ok "music-mode-nft -> $NFT_WRAPPER_DEST (0755 root:root)"
@@ -262,24 +299,42 @@ assert_root_owned() {
     fi
 }
 
+# Walks the FULL ancestor chain, not just the immediate parent: a writable
+# /usr/local lets an attacker replace the whole bin/ directory, which defeats
+# a check that only ever looked at /usr/local/bin and the file itself.
 verify_wrapper_target() {
-    assert_root_owned "$(dirname "$NFT_WRAPPER_DEST")"
+    local dir="$NFT_WRAPPER_DEST"
     assert_root_owned "$NFT_WRAPPER_DEST"
-    log_ok "$NFT_WRAPPER_DEST verified root-owned and not user-writable"
+    while true; do
+        dir="$(dirname "$dir")"
+        assert_root_owned "$dir"
+        [[ "$dir" == "/" ]] && break
+    done
+    log_ok "$NFT_WRAPPER_DEST verified root-owned, with a root-owned ancestor chain"
 }
 
 install_desktop_entry() {
+    local tmp_desktop
     mkdir -p "$DESKTOP_DIR"
+
+    # Render to a temp file, validate, then move into place. Redirecting
+    # straight to $DESKTOP_DEST would truncate the user's working launcher
+    # before sed produced a single byte, so a failed render would destroy
+    # the existing entry instead of leaving it alone.
+    tmp_desktop="$(mktemp)"
     # Pipe delimiter: $HOME contains slashes and would break s/../../.
-    if ! sed "s|__HOME__|$HOME|g" "$SRC_DESKTOP" > "$DESKTOP_DEST"; then
-        log_error "failed rendering $SRC_DESKTOP -> $DESKTOP_DEST"
+    if ! sed "s|__HOME__|$HOME|g" "$SRC_DESKTOP" > "$tmp_desktop"; then
+        rm -f "$tmp_desktop"
+        log_error "failed rendering $SRC_DESKTOP"
         exit 1
     fi
-    if [[ ! -s "$DESKTOP_DEST" ]] || grep -q '__HOME__' "$DESKTOP_DEST"; then
-        log_error "$DESKTOP_DEST is empty or still contains __HOME__ — render failed"
+    if [[ ! -s "$tmp_desktop" ]] || grep -q '__HOME__' "$tmp_desktop"; then
+        rm -f "$tmp_desktop"
+        log_error "rendered desktop entry is empty or still contains __HOME__ — aborting"
         exit 1
     fi
-    chmod 0644 "$DESKTOP_DEST"
+    install -m 0644 "$tmp_desktop" "$DESKTOP_DEST"
+    rm -f "$tmp_desktop"
     if command -v kbuildsycoca6 >/dev/null 2>&1; then
         kbuildsycoca6 >/dev/null 2>&1 || true
     fi
@@ -303,13 +358,25 @@ install_tray_unit() {
     if [[ "$TRAY_DEPS_OK" != "true" ]]; then
         log_warning "not enabling music-mode-tray.service — python dbus/gi missing"
         log_warning "  the unit restarts on failure every 5s; it would crash-loop silently"
+        # Merely declining to enable is not enough on a machine where a
+        # previous install already enabled it: without this the unit stays
+        # enabled and crash-loops on exactly the missing deps we detected.
+        if systemctl --user is-enabled --quiet music-mode-tray.service 2>/dev/null; then
+            systemctl --user disable --now music-mode-tray.service >/dev/null 2>&1 || true
+            log_warning "  it was already enabled — stopped and disabled it to stop the crash-loop"
+        fi
         log_warning "  after installing python-dbus and python-gobject, run:"
         log_warning "    systemctl --user enable --now music-mode-tray.service"
         return 0
     fi
 
     if systemctl --user enable --now music-mode-tray.service >/dev/null 2>&1; then
-        log_ok "music-mode-tray.service enabled and started"
+        # `enable --now` is a no-op against an already-running unit, so the
+        # daemon would keep executing the PREVIOUS copy of music-mode-tray
+        # until the next login. Re-running install.sh is documented as the
+        # repair step, so it has to actually redeploy the tray code.
+        systemctl --user try-restart music-mode-tray.service >/dev/null 2>&1 || true
+        log_ok "music-mode-tray.service enabled and (re)started"
     else
         log_warning "could not enable music-mode-tray.service — check: systemctl --user status music-mode-tray.service"
     fi
@@ -328,6 +395,18 @@ assert_sudoers_content() {
     fi
     if grep -q '__USER__' "$TMP_SUDOERS"; then
         log_error "rendered sudoers still contains __USER__ — substitution failed"
+        exit 1
+    fi
+
+    # `#include` / `#includedir` (and the modern @ forms) are sudoers
+    # DIRECTIVES, not comments — sudo pulls in and executes the referenced
+    # policy. The comment-stripping regex below would happily classify them
+    # as comments, so an include smuggled into the template would survive
+    # both the line count and the exact-match check. Reject them outright:
+    # this file is only ever allowed to carry one User_Spec.
+    if grep -qE '^[[:space:]]*[#@]include(dir)?[[:space:]]' "$TMP_SUDOERS"; then
+        log_error "rendered sudoers contains an #include/@include directive — aborting"
+        log_error "  this drop-in must contain exactly one rule and nothing else"
         exit 1
     fi
 
@@ -373,18 +452,78 @@ install_sudoers() {
     # seconds on `systemctl --user enable --now`. The file is 0600 and
     # user-owned, so only same-user code could rewrite it in that window,
     # but user-code-to-root is exactly the escalation this file exists to
-    # prevent. Re-checking here costs nothing and closes the window.
+    # prevent.
+    #
+    # This NARROWS the window; it cannot close it, because `sudo install`
+    # re-opens and re-reads the file itself — a read this script cannot
+    # make atomic with its own check. The post-install verification below
+    # is what makes a successful swap non-silent: a mismatched grant is
+    # removed immediately and the install fails loudly.
     assert_sudoers_content
 
     sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_DEST"
     rm -f "$TMP_SUDOERS"
     TMP_SUDOERS=""
+
+    if ! sudo grep -qxF "$SUDOERS_RULE" "$SUDOERS_DEST"; then
+        log_error "$SUDOERS_DEST does not contain the expected grant after install"
+        log_error "  removing it rather than leaving an unverified NOPASSWD rule in place"
+        sudo rm -f "$SUDOERS_DEST"
+        exit 1
+    fi
+
     log_ok "sudoers drop-in -> $SUDOERS_DEST (0440 root:root, user: $INSTALL_USER)"
 }
 
 # --- main --------------------------------------------------------------
 
+# A preview that cannot fail previews nothing. Runs every gate that does not
+# require root or a write, so a dry run on a machine where the real install
+# would abort actually says so. The two gates it cannot reach are noted in
+# the output rather than silently skipped.
+dry_run_checks() {
+    local tmp
+
+    tmp="$(mktemp)"
+    TMP_SUDOERS="$tmp"
+    chmod 0600 "$tmp"
+    if ! sed "s/__USER__/$INSTALL_USER/g" "$SRC_SUDOERS" > "$tmp"; then
+        log_error "sed failed rendering $SRC_SUDOERS"
+        exit 1
+    fi
+    assert_sudoers_content
+    rm -f "$tmp"
+    TMP_SUDOERS=""
+    log_ok "sudoers template renders to exactly the expected grant"
+
+    # Only meaningful if a wrapper is already deployed; on a first install
+    # there is nothing to check yet.
+    if [[ -e "$NFT_WRAPPER_DEST" ]]; then
+        verify_wrapper_target
+    else
+        log_info "  ($NFT_WRAPPER_DEST not present yet — ownership check runs on install)"
+    fi
+
+    log_warning "not checked in dry run (both need sudo): 'visudo -c' on the rendered"
+    log_warning "  grant, and the post-install verification of $SUDOERS_DEST"
+}
+
 main() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run) DRY_RUN=true ;;
+            -h|--help)
+                sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+                return 0
+                ;;
+            *)
+                log_error "unknown argument: $arg (accepts --dry-run, --help)"
+                return 1
+                ;;
+        esac
+    done
+
     log_info "==> Installing music-mode (from $SCRIPT_DIR)"
 
     require_unprivileged
@@ -394,6 +533,7 @@ main() {
     preflight
 
     if [[ "$DRY_RUN" == "true" ]]; then
+        dry_run_checks
         dry_run_report
         return 0
     fi
@@ -410,6 +550,7 @@ main() {
     install_tray_unit
     install_sudoers
 
+    INSTALL_COMPLETE="true"
     log_ok "music-mode install complete"
     log_info "Usage: music-mode [on|off|toggle|status]  —  or Meta+Shift+M to toggle"
     log_info "Verify the grant with: sudo -l"
