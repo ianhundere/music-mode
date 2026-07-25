@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Music Mode
+Comment=Toggle music-mode focus (on/off)
+Exec=__HOME__/.local/bin/music-mode toggle
+Icon=headphone
+Type=Application
+Categories=AudioVideo;Audio;Music;
+Keywords=focus;music;bitwig;daw;
+Terminal=false
+StartupNotify=false
+X-KDE-Shortcuts=Meta+Shift+M

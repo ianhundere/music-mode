@@ -1,0 +1,7 @@
+# music-mode sudoers drop-in (template)
+# __USER__ is replaced with the current $USER at install time by ./install.sh.
+# Installed to /etc/sudoers.d/music-mode (mode 0440, owner root:root)
+# The target must live in a root-owned path — a NOPASSWD rule on a
+# user-writable script is a trivial root escalation.
+
+__USER__ ALL=(root) NOPASSWD: /usr/local/bin/music-mode-nft on, /usr/local/bin/music-mode-nft off

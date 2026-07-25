@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""music-mode-tray — system tray icon for music-mode focus CLI.
+
+Registers a StatusNotifierItem in the KDE system tray. Left-click toggles
+music-mode on/off. Icon reflects current state (media-record=on,
+folder-music=off). Watches the session file so CLI and tray stay in sync.
+
+Installed by: ./install.sh  (from the music-mode repo)
+Runs as: systemd user service (music-mode-tray.service)
+"""
+
+import os
+import subprocess
+import sys
+import signal
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+MUSIC_MODE = os.path.expanduser("~/.local/bin/music-mode")
+SESSION_FILE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "music-mode", "session"
+)
+SESSION_DIR = os.path.dirname(SESSION_FILE)
+
+ICON_ON = "media-record"
+ICON_OFF = "folder-music"
+TOOLTIP_ON = "Music Mode — ON (click to exit)"
+TOOLTIP_OFF = "Music Mode — OFF (click to enter)"
+
+BUS_NAME = "org.kde.StatusNotifierItem-music-mode"
+OBJ_PATH = "/StatusNotifierItem"
+
+
+def is_on():
+    return os.path.isfile(SESSION_FILE)
+
+
+def toggle():
+    subprocess.Popen(
+        [MUSIC_MODE, "toggle"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+class StatusNotifierItem(dbus.service.Object):
+    """Minimal StatusNotifierItem implementation for KDE system tray."""
+
+    IFACE = "org.kde.StatusNotifierItem"
+
+    def __init__(self, bus):
+        self._bus = bus
+        bus_name = dbus.service.BusName(BUS_NAME, bus)
+        super().__init__(bus_name, OBJ_PATH)
+        self._on = is_on()
+        self._register_host()
+
+    def _register_host(self):
+        """Tell the StatusNotifierWatcher we exist."""
+        try:
+            watcher = self._bus.get_object(
+                "org.kde.StatusNotifierWatcher",
+                "/StatusNotifierWatcher",
+            )
+            watcher.RegisterStatusNotifierItem(
+                BUS_NAME,
+                dbus_interface="org.kde.StatusNotifierWatcher",
+            )
+        except dbus.DBusException as e:
+            print(f"Warning: could not register with StatusNotifierWatcher: {e}",
+                  file=sys.stderr)
+
+    def refresh(self):
+        """Check session state and update icon if changed."""
+        new_state = is_on()
+        if new_state != self._on:
+            self._on = new_state
+            self.NewIcon()
+            self.NewToolTip()
+        return True  # keep GLib timeout alive
+
+    # --- DBus properties ---
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE,
+                         in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        if interface != self.IFACE:
+            raise dbus.DBusException(f"Unknown interface: {interface}")
+        return self._get_prop(prop)
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE,
+                         in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        if interface != self.IFACE:
+            return {}
+        props = {}
+        for name in ("Id", "Category", "Status", "IconName",
+                     "Title", "ToolTip", "ItemIsMenu", "Menu"):
+            try:
+                props[name] = self._get_prop(name)
+            except dbus.DBusException:
+                pass
+        return props
+
+    def _get_prop(self, prop):
+        if prop == "Id":
+            return "music-mode"
+        if prop == "Category":
+            return "ApplicationStatus"
+        if prop == "Status":
+            return "Active" if self._on else "Passive"
+        if prop == "IconName":
+            return ICON_ON if self._on else ICON_OFF
+        if prop == "Title":
+            return "Art Mode"
+        if prop == "ToolTip":
+            tip = TOOLTIP_ON if self._on else TOOLTIP_OFF
+            icon = ICON_ON if self._on else ICON_OFF
+            return dbus.Struct((icon, dbus.Array([], signature="(iiay)"),
+                                "Music Mode", tip),
+                               signature="sa(iiay)ss")
+        if prop == "ItemIsMenu":
+            return False
+        if prop == "Menu":
+            return dbus.ObjectPath("/NO_DBUSMENU")
+        raise dbus.DBusException(f"Unknown property: {prop}")
+
+    # --- Actions ---
+
+    @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii")
+    def Activate(self, x, y):
+        toggle()
+
+    @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii")
+    def SecondaryActivate(self, x, y):
+        toggle()
+
+    # --- Signals ---
+
+    @dbus.service.signal("org.kde.StatusNotifierItem")
+    def NewIcon(self):
+        pass
+
+    @dbus.service.signal("org.kde.StatusNotifierItem")
+    def NewToolTip(self):
+        pass
+
+    @dbus.service.signal("org.kde.StatusNotifierItem")
+    def NewStatus(self, status):
+        pass
+
+
+def main():
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+    item = StatusNotifierItem(bus)
+
+    # Poll session file every 2 seconds to stay in sync with CLI usage
+    GLib.timeout_add_seconds(2, item.refresh)
+
+    # Clean exit on SIGTERM/SIGINT
+    loop = GLib.MainLoop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+
+    loop.run()
+
+
+if __name__ == "__main__":
+    main()

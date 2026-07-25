@@ -1,0 +1,32 @@
+# BMAD / agent scaffolding — never committed
+_bmad/
+_bmad-output/
+.claude/
+.agent/
+.agents/
+.bmad-loop/
+
+# Rendered install artifacts. The tracked sources are the *.in templates;
+# a rendered copy contains a real username / $HOME and must never be
+# committed over the top of its template.
+/etc/sudoers.d/music-mode
+/share/applications/music-mode-toggle.desktop
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Scratch
+*.bak
+*.tmp
+*.log

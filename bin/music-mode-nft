@@ -1,0 +1,35 @@
+#!/bin/bash
+# music-mode-nft — load/unload the music-mode nftables ruleset.
+# Run via sudo. Confines outbound traffic to the Bitwig systemd scope.
+#
+# SUDO_UID is the UID of the user who invoked sudo; we use it to
+# construct the scope's cgroup path. Fallback to id -u for testing.
+set -euo pipefail
+
+SCOPE_UID="${SUDO_UID:-$(id -u)}"
+CGROUP_PATH="user.slice/user-${SCOPE_UID}.slice/user@${SCOPE_UID}.service/app.slice/music-mode-bitwig.scope"
+
+case "${1:-}" in
+    on)
+        nft -f - <<EOF
+table inet music_mode {
+    chain output {
+        type filter hook output priority 0; policy accept
+        oif "lo" accept
+        meta skuid < 1000 accept
+        socket cgroupv2 level 5 "$CGROUP_PATH" accept
+        counter drop
+    }
+}
+EOF
+        ;;
+    off)
+        if nft list table inet music_mode >/dev/null 2>&1; then
+            nft delete table inet music_mode
+        fi
+        ;;
+    *)
+        echo "Usage: music-mode-nft on|off" >&2
+        exit 1
+        ;;
+esac

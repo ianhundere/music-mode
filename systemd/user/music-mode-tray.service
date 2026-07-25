@@ -1,0 +1,12 @@
+[Unit]
+Description=Music Mode system tray icon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/music-mode-tray
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

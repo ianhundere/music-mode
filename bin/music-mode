@@ -1,0 +1,301 @@
+#!/bin/bash
+# music-mode — focus CLI for music/art work on T14s Arch.
+#
+# Confines outbound network traffic to Bitwig (run in a systemd user
+# scope) plus system services. Everything else — browsers, chat,
+# curl, etc. — is blocked at the kernel via nftables.
+#
+# Subcommands:
+#   on      Kill chat/mail/browser apps, enable KDE Do Not Disturb,
+#           launch Bitwig in a cgroup scope, load nftables rules.
+#   off     Destroy nftables rules, release KDE DnD, clear session.
+#           (Bitwig is left running.)
+#   status  Show current state and elapsed session time (default).
+#
+# Session state: $XDG_CACHE_HOME/music-mode/session (ISO-8601 timestamp)
+# Installed by:  ./install.sh  (from the music-mode repo)
+
+set -euo pipefail
+
+SESSION_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/music-mode"
+SESSION_FILE="$SESSION_DIR/session"
+BITWIG_SCOPE="music-mode-bitwig.scope"
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+NC=$'\033[0m'
+
+msg()  { printf '%b%s%b\n' "$1" "$2" "$NC"; }
+warn() { printf '%b⚠ %s%b\n' "$YELLOW" "$*" "$NC" >&2; }
+err()  { printf '%b✗ %s%b\n' "$RED" "$*" "$NC" >&2; }
+
+# Distraction apps killed on enter — chat, mail, and browsers.
+# Patterns are matched via `pkill -f` against the full command line.
+# The `[/]` prefix matches a literal `/` but avoids matching pkill itself.
+DISTRACTIONS=(
+    '[/]signal-desktop'
+    '[/]discord'
+    '[/]thunderbird'
+    '[/]firefox'
+    '[/]chromium'
+    '[/]chrome'
+    '[/]bin/code'
+)
+
+# Flatpak apps run inside bwrap sandboxes; their /app-anchored command lines
+# usually still match the patterns above, but not dependably, and pkill leaves
+# the bwrap supervisor behind — so also sweep by app-id as defense-in-depth.
+# Includes flatpak ids for currently-native apps too: a no-op unless installed,
+# so a later native→flatpak switch doesn't silently escape the kill list.
+FLATPAK_DISTRACTIONS=(
+    'org.mozilla.thunderbird_esr'
+    'org.mozilla.Thunderbird'
+    'org.signal.Signal'
+    'com.discordapp.Discord'
+    'org.mozilla.firefox'
+    'org.chromium.Chromium'
+    'com.google.Chrome'
+    'com.visualstudio.code'
+)
+
+usage() {
+    cat <<'EOF'
+Usage: music-mode [on|off|toggle|status]
+
+  on      Kill distraction apps, enable KDE DnD, launch Bitwig in a
+          systemd scope, block all non-Bitwig outbound traffic.
+  off     Restore network, release DnD, clear session.
+          (Bitwig is left running.)
+  toggle  On if off, off if on.
+  status  Show current state and elapsed time (default).
+
+Session state: ~/.cache/music-mode/session
+EOF
+}
+
+is_on() { [[ -f "$SESSION_FILE" ]]; }
+
+read_start() { [[ -f "$SESSION_FILE" ]] && cat "$SESSION_FILE" || echo ""; }
+
+elapsed() {
+    local start="$1"
+    local s_epoch now diff
+    s_epoch=$(date -d "$start" +%s 2>/dev/null || echo "")
+    if [[ -z "$s_epoch" ]]; then
+        printf 'unknown'
+        return
+    fi
+    now=$(date +%s)
+    diff=$((now - s_epoch))
+    printf '%dh%02dm' $((diff / 3600)) $(((diff % 3600) / 60))
+}
+
+# After a kernel upgrade the running kernel's /lib/modules tree is deleted, so
+# module autoload is dead until the next boot. The ruleset's cgroupv2 match
+# needs nft_socket — only blame the kernel when that module is both not already
+# loaded AND no longer loadable; otherwise a failure has some other cause
+# (sudoers, vanished Bitwig scope) and deserves the re-install hint.
+stale_kernel() { [[ ! -d "/lib/modules/$(uname -r)" && ! -d /sys/module/nft_socket ]]; }
+
+nft_block() {
+    if ! sudo -n /usr/local/bin/music-mode-nft on; then
+        err "nft rule load failed"
+        if stale_kernel; then
+            err "  cause: running kernel's modules are missing (kernel upgraded since boot?)"
+            err "  fix: reboot"
+        else
+            err "  fix: ./install.sh"
+        fi
+        return 1
+    fi
+}
+
+nft_unblock() {
+    sudo -n /usr/local/bin/music-mode-nft off 2>/dev/null || \
+        warn "nft rule unload failed — remove manually with 'sudo nft delete table inet music_mode'"
+}
+
+# Suppress/release KDE notifications. The freedesktop Inhibit call is tied
+# to the caller's D-Bus connection — plasmashell drops it the moment a
+# one-shot caller exits — so the inhibition must be held by a long-lived
+# process: kde-inhibit inside a transient user unit.
+DND_UNIT="music-mode-dnd.service"
+
+kde_dnd_on() {
+    if ! command -v kde-inhibit >/dev/null 2>&1; then
+        warn "kde-inhibit not found — notifications not suppressed"
+        return 0
+    fi
+    systemctl --user is-active --quiet "$DND_UNIT" 2>/dev/null && return 0
+    systemd-run --user --quiet --unit="${DND_UNIT%.service}" --collect \
+        kde-inhibit --notifications sleep infinity 2>/dev/null || \
+        warn "notification inhibit failed — continuing"
+}
+
+kde_dnd_off() {
+    systemctl --user stop "$DND_UNIT" 2>/dev/null || true
+}
+
+# Failures triggered from the tray have no terminal; surface them as a
+# desktop notification too.
+notify_fail() {
+    err "$*"
+    command -v notify-send >/dev/null 2>&1 && \
+        notify-send -u critical "music-mode" "$*" 2>/dev/null || true
+}
+
+kill_distractions() {
+    local pattern app fp_app fp_pid
+    local have_flatpak=""
+    command -v flatpak >/dev/null 2>&1 && have_flatpak=1
+    # First pass: graceful SIGTERM.
+    for pattern in "${DISTRACTIONS[@]}"; do
+        pkill -f "$pattern" 2>/dev/null || true
+    done
+    # Flatpak sandboxes get their graceful TERM via the sandbox pid-1 —
+    # `flatpak kill` below is SIGKILL-only, and Thunderbird's mail store
+    # deserves a chance to close cleanly.
+    if [[ -n "$have_flatpak" ]]; then
+        while read -r fp_app fp_pid; do
+            for app in "${FLATPAK_DISTRACTIONS[@]}"; do
+                if [[ "$fp_app" == "$app" && -n "${fp_pid:-}" ]]; then
+                    kill -TERM "$fp_pid" 2>/dev/null || true
+                fi
+            done
+        done < <(flatpak ps --columns=application,child-pid 2>/dev/null || true)
+    fi
+    # Discord and some Electron apps trap SIGTERM and keep running. Give
+    # everything a moment to exit cleanly, then SIGKILL any survivors.
+    sleep 1
+    for pattern in "${DISTRACTIONS[@]}"; do
+        pkill -KILL -f "$pattern" 2>/dev/null || true
+    done
+    # Flatpak survivors: hard-kill the sandbox by app-id.
+    if [[ -n "$have_flatpak" ]]; then
+        for app in "${FLATPAK_DISTRACTIONS[@]}"; do
+            flatpak kill "$app" >/dev/null 2>&1 || true
+        done
+    fi
+}
+
+bitwig_scope_running() {
+    systemctl --user is-active --quiet "$BITWIG_SCOPE" 2>/dev/null
+}
+
+# Preconditions checked BEFORE any distraction apps are killed, so a
+# doomed engage doesn't close the user's browsers/chat for nothing.
+bitwig_preflight() {
+    bitwig_scope_running && return 0
+    if pgrep -x bitwig-studio >/dev/null 2>&1; then
+        notify_fail "Bitwig is running outside the music-mode scope — quit it (killall bitwig-studio) and re-run"
+        return 1
+    fi
+    if ! command -v bitwig-studio >/dev/null 2>&1; then
+        notify_fail "bitwig-studio not in PATH — cannot engage music-mode"
+        return 1
+    fi
+}
+
+launch_bitwig() {
+    if bitwig_scope_running; then
+        msg "$BLUE" "  → Bitwig scope already running"
+        return 0
+    fi
+    msg "$BLUE" "  → launching Bitwig in scope $BITWIG_SCOPE"
+    local env_args=()
+    [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] && env_args=(--setenv=GDK_BACKEND=x11)
+    systemd-run --user --scope --quiet \
+        --unit="$BITWIG_SCOPE" \
+        "${env_args[@]}" \
+        bitwig-studio </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+
+    # Wait for the scope to be registered so nft can match its cgroup.
+    local waited=0
+    while (( waited < 50 )); do
+        bitwig_scope_running && return 0
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    warn "Bitwig scope did not become active within 5s"
+    return 1
+}
+
+cmd_on() {
+    if is_on; then
+        local start
+        start=$(read_start)
+        msg "$GREEN" "🎧 music-mode already on — since $start ($(elapsed "$start"))"
+        return 0
+    fi
+    msg "$BLUE" "==> Entering music-mode"
+    bitwig_preflight || return 1
+    # nft is guaranteed to fail on a stale kernel — abort before killing the
+    # user's apps for a doomed engage (same principle as bitwig_preflight).
+    if stale_kernel; then
+        notify_fail "music-mode not engaged — kernel upgraded since boot; reboot so nft modules can load (nothing was changed)"
+        return 1
+    fi
+    kill_distractions
+    msg "$GREEN" "  ✓ distraction apps killed"
+    if ! launch_bitwig; then
+        notify_fail "cannot engage music-mode without an active Bitwig scope"
+        return 1
+    fi
+    kde_dnd_on
+    msg "$GREEN" "  ✓ notifications suppressed"
+    if ! nft_block; then
+        kde_dnd_off
+        if stale_kernel; then
+            notify_fail "music-mode not engaged — reboot so kernel modules can load (network unrestricted, notifications restored)"
+        else
+            notify_fail "music-mode not engaged — nft rule load failed (network unrestricted, notifications restored)"
+        fi
+        return 1
+    fi
+    msg "$GREEN" "  ✓ non-Bitwig network blocked"
+    mkdir -p "$SESSION_DIR"
+    date -Iseconds > "$SESSION_FILE"
+    msg "$GREEN" "🎧 music-mode on — since $(read_start)"
+}
+
+cmd_off() {
+    msg "$BLUE" "==> Exiting music-mode"
+    nft_unblock
+    msg "$GREEN" "  ✓ network restored"
+    kde_dnd_off
+    msg "$GREEN" "  ✓ notifications released"
+    if is_on; then
+        local start
+        start=$(read_start)
+        rm -f "$SESSION_FILE"
+        msg "$GREEN" "🎧 music-mode off — session was $(elapsed "$start")"
+    else
+        msg "$BLUE" "🎧 music-mode off (no active session — recovery unblock)"
+    fi
+}
+
+cmd_status() {
+    if is_on; then
+        local start
+        start=$(read_start)
+        msg "$GREEN" "🎧 music-mode on — since $start ($(elapsed "$start"))"
+    else
+        msg "$BLUE" "music-mode off"
+    fi
+}
+
+cmd_toggle() {
+    if is_on; then cmd_off; else cmd_on; fi
+}
+
+case "${1:-status}" in
+    on)              cmd_on ;;
+    off)             cmd_off ;;
+    toggle)          cmd_toggle ;;
+    status)          cmd_status ;;
+    -h|--help|help)  usage ;;
+    *)               usage; exit 1 ;;
+esac
