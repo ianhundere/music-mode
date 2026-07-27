@@ -175,6 +175,13 @@ sudo ./bin/bitwig-hosts on
 sudo ./bin/bitwig-hosts off
 ```
 
+To have it on `PATH` without copying it — a copy silently drifts from the repo
+the first time either side changes — symlink it instead:
+
+```bash
+ln -s "$PWD/bin/bitwig-hosts" ~/bin/bitwig-hosts
+```
+
 ## Files
 
 - [`bin/music-mode`](bin/music-mode) — the CLI (bash)
