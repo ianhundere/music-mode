@@ -15,6 +15,7 @@ It runs as the same user you normally use — no second Linux account to manage.
 - [Files](#files)
 - [Removal](#removal)
 - [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ## What It Does
 
@@ -277,3 +278,7 @@ Run `sudo nft delete table inet music_mode` manually.
 music-mode status              # reads ~/.cache/music-mode/session
 sudo nft list table inet music_mode   # the actual live ruleset
 ```
+
+## License
+
+[MIT](LICENSE) — do what you like with it.
