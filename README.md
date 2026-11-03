@@ -43,7 +43,11 @@ Then:
    (`music-mode-bitwig.scope`) so its traffic can be allowlisted at the kernel
    level. On Wayland it is started with `GDK_BACKEND=x11`. It then waits up to
    5s for the scope to register — nft cannot match a cgroup that does not exist
-   yet — and aborts if it never appears.
+   yet — and aborts if it never appears. Before launching, it stops any Wine
+   prefix still running from an earlier Bitwig (`wineserver -k`, for
+   `$WINEPREFIX` or `~/.wine`) and any leftover scope, so the prefix boots again
+   inside the new scope. Wine plugins' background services, such as iLok's PACE
+   `LDSvc.exe`, then share Bitwig's network access instead of being blocked.
 3. **Suppresses KDE notifications** by running `kde-inhibit --notifications` in
    a transient user unit, `music-mode-dnd.service`. It has to be a long-lived
    process: the freedesktop Inhibit call is tied to the caller's D-Bus
@@ -257,6 +261,15 @@ quickly. Check `pgrep bitwig-studio` and `systemctl --user list-units --type=sco
 Bitwig was started normally, so its traffic is not in the cgroup the ruleset
 allowlists. Quit it (`killall bitwig-studio`) and run `music-mode on` again so
 it is launched inside the scope. Nothing was changed.
+
+**iLok / PACE errors under Wine (e.g. a PSP plugin) while music-mode is on:**
+iLok's license service (`LDSvc.exe`) phones home over the network. It belongs
+to the Wine prefix, not to Bitwig. A Bitwig launcher that keeps the prefix
+alive with `wineserver -p` leaves it running in whichever cgroup first started
+it, which may be outside the scope. `music-mode on` restarts the prefix inside
+the scope whenever Bitwig is not already running. If Bitwig was already
+running in the scope, it warns `iLok's license service (LDSvc) runs outside the
+Bitwig scope`: quit Bitwig and run `music-mode on` again.
 
 **`Bitwig scope did not become active within 5s`:**
 The scope was requested but never registered. Check that `bitwig-studio` starts

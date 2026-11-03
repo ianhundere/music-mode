@@ -186,10 +186,53 @@ bitwig_scope_running() {
     systemctl --user is-active --quiet "$BITWIG_SCOPE" 2>/dev/null
 }
 
+in_bitwig_scope() { # pid
+    grep -q "/${BITWIG_SCOPE}\$" "/proc/$1/cgroup" 2>/dev/null
+}
+
+# Bitwig itself running inside the scope. The scope being active is not
+# enough: a persistent wineserver can keep it alive after Bitwig quits.
+bitwig_in_scope() {
+    local pid
+    for pid in $(pgrep -x bitwig-studio 2>/dev/null); do
+        in_bitwig_scope "$pid" && return 0
+    done
+    return 1
+}
+
+# Bitwig's Wine prefix (yabridge plugin hosts, iLok's PACE LDSvc.exe) must run
+# inside the Bitwig scope, or the nft rule cuts its network and iLok errors when
+# it phones home. A Bitwig launcher that boots the prefix with a persistent
+# `wineserver -p` (to beat iLok's "Error 2000" race) leaves it running after
+# Bitwig quits, in whatever cgroup launched it: outside the scope, or holding
+# the old scope open. Bitwig is not running here (bitwig_preflight refused if
+# it was), so stop the prefix and let this session's launch boot it fresh
+# inside the scope.
+reset_wine_prefix() {
+    local prefix="${WINEPREFIX:-$HOME/.wine}"
+    if command -v wineserver >/dev/null 2>&1 && pgrep -u "$USER" -x wineserver >/dev/null 2>&1; then
+        WINEPREFIX="$prefix" wineserver -k >/dev/null 2>&1 || true
+        WINEPREFIX="$prefix" timeout 10 wineserver -w >/dev/null 2>&1 || true
+        msg "$BLUE" "  → stopped the Wine prefix so it restarts inside the Bitwig scope (iLok network)"
+    fi
+    # Anything still holding the scope open would make launch_bitwig skip.
+    if bitwig_scope_running; then
+        systemctl --user stop "$BITWIG_SCOPE" >/dev/null 2>&1 || true
+    fi
+}
+
+ilok_outside_scope() {
+    local pid
+    for pid in $(pgrep -u "$USER" -f 'LDSvc\.exe' 2>/dev/null); do
+        in_bitwig_scope "$pid" || return 0
+    done
+    return 1
+}
+
 # Preconditions checked BEFORE any distraction apps are killed, so a
 # doomed engage doesn't close the user's browsers/chat for nothing.
 bitwig_preflight() {
-    bitwig_scope_running && return 0
+    bitwig_in_scope && return 0
     if pgrep -x bitwig-studio >/dev/null 2>&1; then
         notify_fail "Bitwig is running outside the music-mode scope — quit it (killall bitwig-studio) and re-run"
         return 1
@@ -201,10 +244,14 @@ bitwig_preflight() {
 }
 
 launch_bitwig() {
-    if bitwig_scope_running; then
+    if bitwig_in_scope; then
         msg "$BLUE" "  → Bitwig scope already running"
+        if ilok_outside_scope; then
+            warn "iLok's license service (LDSvc) runs outside the Bitwig scope, so it has no network this session — quit Bitwig and run music-mode on again"
+        fi
         return 0
     fi
+    reset_wine_prefix
     msg "$BLUE" "  → launching Bitwig in scope $BITWIG_SCOPE"
     local env_args=()
     [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] && env_args=(--setenv=GDK_BACKEND=x11)
