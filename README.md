@@ -271,6 +271,16 @@ the scope whenever Bitwig is not already running. If Bitwig was already
 running in the scope, it warns `iLok's license service (LDSvc) runs outside the
 Bitwig scope`: quit Bitwig and run `music-mode on` again.
 
+**iLok *Error 2000* ("an iLok background component ... is not running") right
+after `music-mode on`:**
+Restarting the prefix means it boots cold, and a PSP or other iLok plugin that
+loads before `LDSvc.exe` is up fails. music-mode launches `bitwig-studio` by
+name from the session's `PATH`, so a warm-up wrapper only helps if it is on that
+`PATH`. Use `~/.local/bin`, not a directory only your shell rc adds such as
+`~/bin`. The tray and desktop launchers don't read shell rc files. Check with
+`systemctl --user status music-mode-bitwig.scope`: the description should name
+your wrapper, not `/usr/bin/bitwig-studio`.
+
 **`Bitwig scope did not become active within 5s`:**
 The scope was requested but never registered. Check that `bitwig-studio` starts
 on its own, and look at `systemctl --user list-units --type=scope`.
