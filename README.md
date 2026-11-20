@@ -1,6 +1,6 @@
 # music-mode
 
-`music-mode` is a single-command focus ritual for music and art work on Arch + KDE. One command severs the distraction surface — chat and browsers killed, notifications silenced, all network except Bitwig blocked at the kernel. One command reverses it.
+`music-mode` is a single-command focus ritual for music and art work on Arch + KDE. One command severs the distraction surface — chat and browsers killed, notifications silenced, all network except Bitwig blocked at the kernel — and keeps the machine out of the audio's way: background sync paused, idle sleep held off. One command reverses it.
 
 It runs as the same user you normally use — no second Linux account to manage.
 
@@ -48,17 +48,25 @@ Then:
    `$WINEPREFIX` or `~/.wine`) and any leftover scope, so the prefix boots again
    inside the new scope. Wine plugins' background services, such as iLok's PACE
    `LDSvc.exe`, then share Bitwig's network access instead of being blocked.
-3. **Suppresses KDE notifications** by running `kde-inhibit --notifications` in
-   a transient user unit, `music-mode-dnd.service`. It has to be a long-lived
-   process: the freedesktop Inhibit call is tied to the caller's D-Bus
-   connection, so plasmashell drops the inhibition the moment a one-shot caller
-   exits.
+3. **Suppresses KDE notifications and holds off idle sleep** by running
+   `kde-inhibit --notifications --power` in a transient user unit,
+   `music-mode-dnd.service`. It has to be a long-lived process: a freedesktop
+   Inhibit call is tied to the caller's D-Bus connection, so plasmashell and
+   PowerDevil drop the inhibition the moment a one-shot caller exits. `--power`
+   stops PowerDevil's idle timer from suspending the machine in the middle of a
+   take, when your hands are on an instrument and not on the keyboard.
 4. **Loads an nftables table** (`inet music_mode`) that drops all outbound
    traffic from UID ≥ 1000 **except** loopback and traffic from the Bitwig
    scope's cgroup. Bitwig keeps full internet access; browsers, chat, curl etc.
-   are blocked at the kernel. If this step fails, notifications are released
-   again and the session is *not* recorded.
-5. **Records the session start time** in `~/.cache/music-mode/session`.
+   are blocked at the kernel. If this step fails, notifications and idle sleep
+   are released again and the session is *not* recorded.
+5. **Pauses background sync.** Each unit in `PAUSE_UNITS` (Syncthing, by
+   default) that is running is stopped with `systemctl --user stop` and noted in
+   `~/.cache/music-mode/paused-units`. Syncthing rescans and hashes every file
+   Bitwig writes, and its network is blocked for the session anyway. A unit that
+   is not installed or not running is left alone. A unit that will not stop is a
+   warning, not a failed engage.
+6. **Records the session start time** in `~/.cache/music-mode/session`.
 
 Failures are also raised as a critical desktop notification (`notify-send`),
 since the tray and the keyboard shortcut have no terminal to print to.
@@ -66,9 +74,11 @@ since the tray and the keyboard shortcut have no terminal to print to.
 ### `music-mode off`
 
 1. Destroys the nftables table — network fully restored.
-2. Stops `music-mode-dnd.service` — notifications released.
-3. Removes the session file (if present).
-4. **Leaves Bitwig running** — you are mid-session, the DAW is not killed.
+2. Stops `music-mode-dnd.service` — notifications and idle sleep released.
+3. Starts the units `on` paused, and only those: a service you had stopped
+   yourself before the session stays stopped.
+4. Removes the session file (if present).
+5. **Leaves Bitwig running** — you are mid-session, the DAW is not killed.
 
 `off` works even with no active session, as a recovery unblock.
 
@@ -78,12 +88,36 @@ Prints current state and elapsed time. **State is the session file**, not the
 live ruleset — if you tear the table down by hand, `status` will still say
 "on". To check the actual firewall, use `sudo nft list table inet music_mode`.
 
+### Making other jobs wait
+
+music-mode stops what it can stop itself. A scheduled job it cannot stop, such
+as a backup, can check for a session and skip its own run.
+
+A job running **as you** can test for the session file. The file survives a
+reboot and the firewall table does not, so treat a session file older than the
+last boot as stale:
+
+```bash
+session="${XDG_CACHE_HOME:-$HOME/.cache}/music-mode/session"
+boot=$(awk '/^btime/ { print $2 }' /proc/stat)
+if [ -f "$session" ] && [ "$(stat -c %Y "$session")" -ge "$boot" ]; then
+    exit 0   # music-mode is on
+fi
+```
+
+A job running **as root** can test for the firewall table, which exists only
+while the block is live:
+
+```bash
+nft list table inet music_mode >/dev/null 2>&1 && exit 0
+```
+
 ## Requirements
 
 | Package | Why |
 |---|---|
 | `nftables` | the outbound block itself (`nft`) |
-| `kde-cli-tools` | `kde-inhibit`, for notification suppression |
+| `kde-cli-tools` | `kde-inhibit`, for notification suppression and the idle-sleep hold |
 | `python-dbus` | tray icon (StatusNotifierItem over D-Bus) |
 | `python-gobject` | tray icon (GLib main loop) |
 | `flatpak` | *optional* — only needed if any distraction app is a flatpak |
@@ -196,6 +230,7 @@ ln -s "$PWD/bin/bitwig-hosts" ~/bin/bitwig-hosts
 - [`share/applications/music-mode-toggle.desktop.in`](share/applications/music-mode-toggle.desktop.in) — desktop entry template (`__HOME__`) for the app menu, taskbar pin and Meta+Shift+M shortcut
 - [`systemd/user/music-mode-tray.service`](systemd/user/music-mode-tray.service) — user unit for the tray daemon
 - [`install.sh`](install.sh), [`uninstall.sh`](uninstall.sh) — installer and its reverse
+- [`tests/test-pause-units`](tests/test-pause-units) — tests for pausing and resuming background units, run against a fake `systemctl`
 
 Files ending in `.in` are templates; `install.sh` renders them. Rendering never
 happens inside the repo — the sudoers grant is rendered to a `mktemp` file and
@@ -224,6 +259,7 @@ If you removed things by hand mid-session instead, undo the leftovers with:
 ```bash
 sudo nft delete table inet music_mode
 systemctl --user stop music-mode-dnd.service
+systemctl --user start syncthing.service   # if `on` had paused it
 ```
 
 ## Troubleshooting
@@ -287,7 +323,16 @@ on its own, and look at `systemctl --user list-units --type=scope`.
 
 **`kde-inhibit not found` / notification warning on a non-KDE session:**
 Expected without `kde-cli-tools`. `music-mode` warns and continues — firewall,
-apps and Bitwig still transition correctly.
+apps and Bitwig still transition correctly. Notifications are not suppressed and
+idle sleep is not held off.
+
+**Syncthing (or another paused unit) is still stopped after `off`:**
+`off` starts whatever is listed in `~/.cache/music-mode/paused-units`. A unit
+that will not start stays on the list and raises a desktop notification, so
+running `music-mode off` again retries it. systemd refuses a unit started too
+many times in a minute, which rapid on/off toggling can reach. If the list was
+deleted by hand mid-session, start the unit yourself:
+`systemctl --user start syncthing.service`.
 
 **Bitwig is not launched:**
 Check `command -v bitwig-studio`. If not in `PATH`, install Bitwig or ensure

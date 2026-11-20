@@ -6,9 +6,11 @@
 # curl, etc. — is blocked at the kernel via nftables.
 #
 # Subcommands:
-#   on      Kill chat/mail/browser apps, enable KDE Do Not Disturb,
-#           launch Bitwig in a cgroup scope, load nftables rules.
-#   off     Destroy nftables rules, release KDE DnD, clear session.
+#   on      Kill chat/mail/browser apps, enable KDE Do Not Disturb and
+#           hold off idle sleep, launch Bitwig in a cgroup scope, load
+#           nftables rules, pause background sync.
+#   off     Destroy nftables rules, release KDE DnD and idle sleep,
+#           restart what was paused, clear session.
 #           (Bitwig is left running.)
 #   status  Show current state and elapsed session time (default).
 #
@@ -60,14 +62,25 @@ FLATPAK_DISTRACTIONS=(
     'com.visualstudio.code'
 )
 
+# Background user services paused for the session: stopped on enter, started
+# again on exit. Syncthing rescans and hashes every file Bitwig writes, and its
+# network is blocked for the session anyway. Only units that are active on
+# enter are touched, so a machine without them sees a no-op.
+PAUSE_UNITS=(
+    'syncthing.service'
+)
+# The units this session stopped, one per line. `off` starts exactly these.
+PAUSED_FILE="$SESSION_DIR/paused-units"
+
 usage() {
     cat <<'EOF'
 Usage: music-mode [on|off|toggle|status]
 
-  on      Kill distraction apps, enable KDE DnD, launch Bitwig in a
-          systemd scope, block all non-Bitwig outbound traffic.
-  off     Restore network, release DnD, clear session.
-          (Bitwig is left running.)
+  on      Kill distraction apps, enable KDE DnD and hold off idle sleep,
+          launch Bitwig in a systemd scope, block all non-Bitwig outbound
+          traffic, pause background sync (Syncthing).
+  off     Restore network, release DnD and idle sleep, restart what was
+          paused, clear session. (Bitwig is left running.)
   toggle  On if off, off if on.
   status  Show current state and elapsed time (default).
 
@@ -119,25 +132,87 @@ nft_unblock() {
         warn "nft rule unload failed — remove manually with 'sudo nft delete table inet music_mode'"
 }
 
-# Suppress/release KDE notifications. The freedesktop Inhibit call is tied
-# to the caller's D-Bus connection — plasmashell drops it the moment a
-# one-shot caller exits — so the inhibition must be held by a long-lived
-# process: kde-inhibit inside a transient user unit.
+# Suppress/release KDE notifications and idle sleep. A freedesktop Inhibit
+# call is tied to the caller's D-Bus connection — plasmashell and PowerDevil
+# drop it the moment a one-shot caller exits — so both inhibitions must be
+# held by a long-lived process: kde-inhibit inside a transient user unit.
+# --power keeps PowerDevil's idle timer from suspending the machine mid-take.
 DND_UNIT="music-mode-dnd.service"
 
 kde_dnd_on() {
+    # Returns 1 when nothing is being held, so the caller does not claim it is.
+    # Never fatal: the session goes ahead without the inhibit.
     if ! command -v kde-inhibit >/dev/null 2>&1; then
-        warn "kde-inhibit not found — notifications not suppressed"
-        return 0
+        warn "kde-inhibit not found — notifications not suppressed, idle sleep not held off"
+        return 1
     fi
     systemctl --user is-active --quiet "$DND_UNIT" 2>/dev/null && return 0
-    systemd-run --user --quiet --unit="${DND_UNIT%.service}" --collect \
-        kde-inhibit --notifications sleep infinity 2>/dev/null || \
-        warn "notification inhibit failed — continuing"
+    if ! systemd-run --user --quiet --unit="${DND_UNIT%.service}" --collect \
+        kde-inhibit --notifications --power sleep infinity 2>/dev/null; then
+        warn "notification and sleep inhibit failed — continuing"
+        return 1
+    fi
 }
 
 kde_dnd_off() {
     systemctl --user stop "$DND_UNIT" 2>/dev/null || true
+}
+
+# Stop the PAUSE_UNITS that are running, and remember which. Never fatal: a
+# unit that will not stop is not worth losing the session over.
+pause_units() {
+    local unit
+    if ! mkdir -p "$SESSION_DIR" 2>/dev/null; then
+        warn "cannot write $SESSION_DIR — background services not paused"
+        return 0
+    fi
+    for unit in "${PAUSE_UNITS[@]}"; do
+        systemctl --user is-active --quiet -- "$unit" 2>/dev/null || continue
+        # Record before stopping. A unit stopped but not recorded would stay
+        # down after `off`; one recorded but not stopped only gets a no-op start.
+        if ! { echo "$unit" >> "$PAUSED_FILE"; } 2>/dev/null; then
+            warn "could not record $unit as paused — leaving it running"
+            continue
+        fi
+        if systemctl --user stop -- "$unit" 2>/dev/null; then
+            msg "$GREEN" "  ✓ paused $unit"
+        elif systemctl --user is-active --quiet -- "$unit" 2>/dev/null; then
+            # Still running, so there is nothing for `off` to start: take it
+            # back off the record.
+            {
+                grep -vxF -- "$unit" "$PAUSED_FILE" > "$PAUSED_FILE.tmp" || true
+                mv -f "$PAUSED_FILE.tmp" "$PAUSED_FILE"
+            } 2>/dev/null || true
+            warn "could not pause $unit — continuing"
+        else
+            # The stop reported an error but the unit is down (a failed stop
+            # job, say). It stays on the record, so `off` starts it again.
+            warn "$unit stopped with an error — off will start it again"
+        fi
+    done
+}
+
+# Start what pause_units stopped. Runs on every `off`, session or not, so a
+# recovery `off` also brings the paused units back.
+resume_units() {
+    local unit failed=()
+    [[ -f "$PAUSED_FILE" ]] || return 0
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        if systemctl --user start -- "$unit" 2>/dev/null; then
+            msg "$GREEN" "  ✓ restarted $unit"
+        else
+            failed+=("$unit")
+        fi
+    done < <(sort -u "$PAUSED_FILE")
+    if (( ${#failed[@]} == 0 )); then
+        rm -f "$PAUSED_FILE"
+        return 0
+    fi
+    # Keep what would not start on the record, so the next `off` tries again,
+    # and say so where the tray can show it: a unit left down is easy to miss.
+    { printf '%s\n' "${failed[@]}" > "$PAUSED_FILE"; } 2>/dev/null || true
+    notify_fail "could not restart ${failed[*]} — run 'music-mode off' again, or: systemctl --user start ${failed[*]}"
 }
 
 # Failures triggered from the tray have no terminal; surface them as a
@@ -293,18 +368,22 @@ cmd_on() {
         notify_fail "cannot engage music-mode without an active Bitwig scope"
         return 1
     fi
-    kde_dnd_on
-    msg "$GREEN" "  ✓ notifications suppressed"
+    if kde_dnd_on; then
+        msg "$GREEN" "  ✓ notifications suppressed, idle sleep held off"
+    fi
     if ! nft_block; then
         kde_dnd_off
         if stale_kernel; then
-            notify_fail "music-mode not engaged — reboot so kernel modules can load (network unrestricted, notifications restored)"
+            notify_fail "music-mode not engaged — reboot so kernel modules can load (network unrestricted, notifications and idle sleep restored)"
         else
-            notify_fail "music-mode not engaged — nft rule load failed (network unrestricted, notifications restored)"
+            notify_fail "music-mode not engaged — nft rule load failed (network unrestricted, notifications and idle sleep restored)"
         fi
         return 1
     fi
     msg "$GREEN" "  ✓ non-Bitwig network blocked"
+    # After the last step that can fail, so a failed engage never leaves a
+    # background service stopped.
+    pause_units
     mkdir -p "$SESSION_DIR"
     date -Iseconds > "$SESSION_FILE"
     msg "$GREEN" "🎧 music-mode on — since $(read_start)"
@@ -315,7 +394,8 @@ cmd_off() {
     nft_unblock
     msg "$GREEN" "  ✓ network restored"
     kde_dnd_off
-    msg "$GREEN" "  ✓ notifications released"
+    msg "$GREEN" "  ✓ notifications and idle sleep released"
+    resume_units
     if is_on; then
         local start
         start=$(read_start)
