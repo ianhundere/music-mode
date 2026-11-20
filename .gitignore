@@ -4,7 +4,15 @@ _bmad-output/
 .claude/
 .agent/
 .agents/
+.gemini/
 .bmad-loop/
+skills-lock.json
+# Redundant with the folders above, but `bmad-loop init` appends these
+# exact lines whenever it doesn't find them, so keep them here.
+.bmad-loop/runs/
+.bmad-loop/cache/
+.bmad-loop/policy.toml
+_bmad/render/
 
 # Rendered install artifacts. The tracked sources are the *.in templates;
 # a rendered copy contains a real username / $HOME and must never be
