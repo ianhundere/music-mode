@@ -248,6 +248,8 @@ recovery_notice() {
     print_msg "$YELLOW" "    sudo nft delete table inet music_mode"
     print_msg "$YELLOW" "    systemctl --user stop $DND_UNIT"
     log_warning "Check with: sudo nft list table inet music_mode"
+    log_warning "If the notifications bell is missing from the tray: System Tray"
+    log_warning "Settings → Entries → Notifications → Shown when relevant."
 }
 
 main() {
