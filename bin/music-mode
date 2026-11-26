@@ -6,11 +6,11 @@
 # curl, etc. — is blocked at the kernel via nftables.
 #
 # Subcommands:
-#   on      Kill chat/mail/browser apps, enable KDE Do Not Disturb and
-#           hold off idle sleep, launch Bitwig in a cgroup scope, load
-#           nftables rules, pause background sync.
-#   off     Destroy nftables rules, release KDE DnD and idle sleep,
-#           restart what was paused, clear session.
+#   on      Kill chat/mail/browser apps, enable KDE Do Not Disturb (its
+#           tray bell hidden) and hold off idle sleep, launch Bitwig in a
+#           cgroup scope, load nftables rules, pause background sync.
+#   off     Destroy nftables rules, release KDE DnD and idle sleep, show
+#           the bell again, restart what was paused, clear session.
 #           (Bitwig is left running.)
 #   status  Show current state and elapsed session time (default).
 #
@@ -146,16 +146,62 @@ kde_dnd_on() {
         warn "kde-inhibit not found — notifications not suppressed, idle sleep not held off"
         return 1
     fi
-    systemctl --user is-active --quiet "$DND_UNIT" 2>/dev/null && return 0
-    if ! systemd-run --user --quiet --unit="${DND_UNIT%.service}" --collect \
-        kde-inhibit --notifications --power sleep infinity 2>/dev/null; then
+    if ! systemctl --user is-active --quiet "$DND_UNIT" 2>/dev/null &&
+        ! systemd-run --user --quiet --unit="${DND_UNIT%.service}" --collect \
+            kde-inhibit --notifications --power sleep infinity 2>/dev/null; then
         warn "notification and sleep inhibit failed — continuing"
         return 1
     fi
+    tray_bell_hide
 }
 
 kde_dnd_off() {
     systemctl --user stop "$DND_UNIT" 2>/dev/null || true
+    tray_bell_show
+}
+
+# While the inhibit is held, Plasma shows its notifications entry in the tray
+# as a crossed-out bell, next to music-mode's own icon, which already says the
+# same thing. Hide that entry for the session by editing the tray's
+# hiddenItems through plasmashell's scripting API, which applies live. The
+# mark records that music-mode hid it, so `off` never un-hides a bell you hid
+# yourself, and a failed un-hide (plasmashell not running) is retried by the
+# next `off`. Never fatal: at worst the bell stays visible.
+TRAY_BELL_MARK="$SESSION_DIR/tray-bell-hidden"
+
+tray_bell() { # hide|show — prints "changed" for each tray it edited
+    busctl --user call org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell \
+        evaluateScript s "var op = '$1';
+var id = 'org.kde.plasma.notifications';
+panels().forEach(function (p) {
+  p.widgets('org.kde.plasma.systemtray').forEach(function (t) {
+    t.currentConfigGroup = ['General'];
+    var h = t.readConfig('hiddenItems', []);
+    var i = h.indexOf(id);
+    if (op == 'hide' && i < 0) h.push(id);
+    else if (op == 'show' && i >= 0) h.splice(i, 1);
+    else return;
+    t.writeConfig('hiddenItems', h);
+    t.reloadConfig();
+    print('changed');
+  });
+});" 2>/dev/null
+}
+
+tray_bell_hide() {
+    [[ -e "$TRAY_BELL_MARK" ]] && return 0
+    # Mark first: a bell hidden with no mark would never come back.
+    { mkdir -p "$SESSION_DIR" && : > "$TRAY_BELL_MARK"; } 2>/dev/null || return 0
+    local out
+    out=$(tray_bell hide) || true
+    [[ "$out" == *changed* ]] || rm -f "$TRAY_BELL_MARK"
+}
+
+tray_bell_show() {
+    [[ -e "$TRAY_BELL_MARK" ]] || return 0
+    if tray_bell show >/dev/null; then
+        rm -f "$TRAY_BELL_MARK"
+    fi
 }
 
 # Stop the PAUSE_UNITS that are running, and remember which. Never fatal: a

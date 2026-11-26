@@ -1,9 +1,10 @@
 #!/bin/bash
-# Test harness for music-mode's pause_units / resume_units.
+# Test harness for music-mode's pause_units / resume_units, and the
+# notification inhibit with its tray bell.
 #
-# Sources the real script with its command dispatch cut off, and runs the two
-# functions against a fake systemctl and a private cache dir. It touches no real
-# unit, kills nothing and loads no firewall.
+# Sources the real script with its command dispatch cut off, and runs single
+# functions against a fake systemctl, systemd-run and busctl and a private cache
+# dir. It touches no real unit or tray, kills nothing and loads no firewall.
 #
 # Usage: tests/test-pause-units [-v]     (exit 0 = all passed)
 
@@ -54,9 +55,25 @@ FAKE
     printf '#!/bin/sh\necho "$*" >> "$MOCK/notify.log"\n' > "$MOCK/bin/notify-send"
     # kde_dnd_on starts its unit with systemd-run: log it, fail on request.
     printf '#!/bin/sh\necho "$*" >> "$MOCK/systemd-run.log"\n[ ! -e "$MOCK/run_fails" ]\n' > "$MOCK/bin/systemd-run"
+    # Fake busctl: plasmashell's tray. The bell is hidden while
+    # $MOCK/bell_hidden exists; $MOCK/no_plasma makes the call fail.
+    cat > "$MOCK/bin/busctl" <<'FAKE'
+#!/bin/bash
+echo "${*:1:6}" >> "$MOCK/busctl.log"
+[ -e "$MOCK/no_plasma" ] && exit 1
+case "${*: -1}" in
+    "var op = 'hide'"*) [ -e "$MOCK/bell_hidden" ] && { echo 's ""'; exit 0; }
+                        : > "$MOCK/bell_hidden" ;;
+    "var op = 'show'"*) [ -e "$MOCK/bell_hidden" ] || { echo 's ""'; exit 0; }
+                        rm -f "$MOCK/bell_hidden" ;;
+esac
+echo 's "changed\n"'
+FAKE
     chmod +x "$MOCK/bin"/*
     : > "$MOCK/systemctl.log"; : > "$MOCK/notify.log"; : > "$MOCK/systemd-run.log"
+    : > "$MOCK/busctl.log"
     RECORD="$MOCK/cache/music-mode/paused-units"
+    MARK="$MOCK/cache/music-mode/tray-bell-hidden"
 }
 teardown() { rm -rf "$MOCK"; }
 
@@ -84,6 +101,8 @@ call_only() {
 running() { : > "$MOCK/active/$1"; }
 active()  { [ -e "$MOCK/active/$1" ] && echo yes || echo no; }
 recorded() { [ -s "$RECORD" ] && echo yes || echo no; }
+bell()    { [ -e "$MOCK/bell_hidden" ] && echo hidden || echo shown; }
+marked()  { [ -e "$MARK" ] && echo yes || echo no; }
 calls()   { grep -c -- " $1 " "$MOCK/systemctl.log"; }
 
 run "the cut-down script still holds the functions under test"
@@ -187,6 +206,58 @@ check "unit fails: returns 1"    "1" "$(call "$MOCK/cache" kde_dnd_on)"
 check "unit fails: warns"        "1" "$(grep -c 'inhibit failed' "$MOCK/out.txt")"
 check "no kde-inhibit: returns 1" "1" "$(call_only kde_dnd_on)"
 check "no kde-inhibit: warns"    "1" "$(grep -c 'kde-inhibit not found' "$MOCK/out.txt")"
+teardown
+
+run "the tray bell is hidden while the inhibit is held, and shown again by off"
+setup
+check "on: returns 0"   "0"      "$(call "$MOCK/cache" kde_dnd_on)"
+check "on: hidden"      "hidden" "$(bell)"
+check "on: marked"      "yes"    "$(marked)"
+call "$MOCK/cache" kde_dnd_on > /dev/null
+check "on again: one edit" "1"  "$(grep -c . "$MOCK/busctl.log")"
+check "off: returns 0"  "0"      "$(call "$MOCK/cache" kde_dnd_off)"
+check "off: shown"      "shown"  "$(bell)"
+check "off: mark gone"  "no"     "$(marked)"
+teardown
+
+run "a bell you hid yourself stays hidden after off"
+setup
+: > "$MOCK/bell_hidden"
+call "$MOCK/cache" kde_dnd_on > /dev/null
+check "on: not marked"  "no"     "$(marked)"
+call "$MOCK/cache" kde_dnd_off > /dev/null
+check "off: hidden"     "hidden" "$(bell)"
+teardown
+
+run "a failed inhibit leaves the bell alone"
+setup
+: > "$MOCK/run_fails"
+call "$MOCK/cache" kde_dnd_on > /dev/null
+check "shown"           "shown"  "$(bell)"
+check "tray untouched"  "0"      "$(grep -c . "$MOCK/busctl.log")"
+teardown
+
+run "no plasmashell: the inhibit still holds, and off retries the bell"
+setup
+: > "$MOCK/no_plasma"
+check "on: returns 0"   "0"      "$(call "$MOCK/cache" kde_dnd_on)"
+check "on: not marked"  "no"     "$(marked)"
+rm "$MOCK/no_plasma"
+call "$MOCK/cache" kde_dnd_on > /dev/null
+: > "$MOCK/no_plasma"
+check "off: returns 0"  "0"      "$(call "$MOCK/cache" kde_dnd_off)"
+check "off: kept mark"  "yes"    "$(marked)"
+rm "$MOCK/no_plasma"
+call "$MOCK/cache" kde_dnd_off > /dev/null
+check "next off: shown" "shown"  "$(bell)"
+check "next off: mark gone" "no" "$(marked)"
+teardown
+
+run "an unwritable cache dir leaves the bell alone"
+setup
+: > "$MOCK/not-a-dir"
+check "returns 0"       "0"      "$(call "$MOCK/not-a-dir" kde_dnd_on)"
+check "shown"           "shown"  "$(bell)"
 teardown
 
 run "pause then resume leaves the unit running and no record"

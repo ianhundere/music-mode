@@ -55,6 +55,12 @@ Then:
    PowerDevil drop the inhibition the moment a one-shot caller exits. `--power`
    stops PowerDevil's idle timer from suspending the machine in the middle of a
    take, when your hands are on an instrument and not on the keyboard.
+   While the inhibit is held, Plasma would show its crossed-out bell in the
+   tray next to music-mode's own icon, so music-mode hides that tray entry
+   (adds `org.kde.plasma.notifications` to the tray's `hiddenItems` through
+   plasmashell's scripting API) and notes that in
+   `~/.cache/music-mode/tray-bell-hidden`. A bell you had hidden yourself is
+   left alone.
 4. **Loads an nftables table** (`inet music_mode`) that drops all outbound
    traffic from UID ≥ 1000 **except** loopback and traffic from the Bitwig
    scope's cgroup. Bitwig keeps full internet access; browsers, chat, curl etc.
@@ -74,7 +80,9 @@ since the tray and the keyboard shortcut have no terminal to print to.
 ### `music-mode off`
 
 1. Destroys the nftables table — network fully restored.
-2. Stops `music-mode-dnd.service` — notifications and idle sleep released.
+2. Stops `music-mode-dnd.service` — notifications and idle sleep released —
+   and shows the tray bell again if `on` hid it. If plasmashell is not running,
+   the note stays and the next `off` tries again.
 3. Starts the units `on` paused, and only those: a service you had stopped
    yourself before the session stays stopped.
 4. Removes the session file (if present).
@@ -261,6 +269,9 @@ sudo nft delete table inet music_mode
 systemctl --user stop music-mode-dnd.service
 systemctl --user start syncthing.service   # if `on` had paused it
 ```
+
+If the notifications bell is still missing from the tray, set it back under
+System Tray Settings → Entries → Notifications → *Shown when relevant*.
 
 ## Troubleshooting
 
